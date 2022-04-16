@@ -320,10 +320,13 @@ class WindowManager:
         self.tasks[self.task_current].show()
 
     def spawn_subprocess(self, command: str) -> None:
-        cwd = self.task_workdirs.get(self.task_current, None)
         env: Dict[str, str] = dict(os.environ)
         env.update({ENV_OUT_TASK_NAME: self.task_current})
-        subprocess.Popen((shutil.which(command),), cwd=cwd, env=env)
+        cwd = self.task_workdirs.get(self.task_current, None)
+        if cwd is not None and os.path.isdir(cwd):
+            subprocess.Popen((shutil.which(command),), cwd=cwd, env=env)
+        else:
+            subprocess.Popen((shutil.which(command),), env=env)
 
     def spawn_task_switcher(self) -> None:
         p1: subprocess.Popen = subprocess.Popen(
