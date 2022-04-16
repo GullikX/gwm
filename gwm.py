@@ -25,6 +25,7 @@ import enum
 import os
 from typing import Callable, Dict, List, Tuple
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -37,26 +38,35 @@ TASK_WORKDIRS_DEFAULT: Dict[str, str] = {"opt": "/opt", "tmp": "/tmp"}
 MASTER_FACTOR_DEFAULT: float = 0.6
 MASTER_FACTOR_MIN: float = 0.1
 MASTER_FACTOR_MAX: float = 0.9
-MASTER_FACTOR_ADJUSTMENT_AMOUNT: float = 0.05
+MASTER_FACTOR_ADJUST_AMOUNT: float = 0.05
 N_WORKSPACES: int = 4
 
-CMD_TERMINAL: Tuple[str, ...] = (shutil.which("st"),)
-CMD_LAUNCHER: Tuple[str, ...] = (shutil.which("dmenu_run"),)
+CMD_DMENU: str = "dmenu"
+CMD_LAUNCHER: str = "dmenu_run"
+CMD_TERMINAL: str = "st"
+CMD_TR: str = "tr"
+CMD_XARGS: str = "xargs"
+CMD_XSETROOT: str = "xsetroot"
 
-KEY_MODMASK = Xlib.X.Mod1Mask
+CMDS: Tuple[str, ...] = (CMD_DMENU, CMD_TERMINAL, CMD_LAUNCHER, CMD_TR, CMD_XARGS, CMD_XSETROOT)
 
+KEY_MODMASK = Xlib.X.Mod4Mask
+
+KEY_MASTER_FACTOR_DEC: Tuple[int, int] = (Xlib.XK.XK_Left, KEY_MODMASK | Xlib.X.ShiftMask)
+KEY_MASTER_FACTOR_INC: Tuple[int, int] = (Xlib.XK.XK_Right, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_MOVE_WINDOW_TO_WORKSPACE_0: Tuple[int, int] = (Xlib.XK.XK_1, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_MOVE_WINDOW_TO_WORKSPACE_1: Tuple[int, int] = (Xlib.XK.XK_2, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_MOVE_WINDOW_TO_WORKSPACE_2: Tuple[int, int] = (Xlib.XK.XK_3, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_MOVE_WINDOW_TO_WORKSPACE_3: Tuple[int, int] = (Xlib.XK.XK_4, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_PROMOTE_WINDOW: Tuple[int, int] = (Xlib.XK.XK_Tab, KEY_MODMASK)
+KEY_QUIT: Tuple[int, int] = (Xlib.XK.XK_F12, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_SWITCH_TO_WORKSPACE_0: Tuple[int, int] = (Xlib.XK.XK_1, KEY_MODMASK)
 KEY_SWITCH_TO_WORKSPACE_1: Tuple[int, int] = (Xlib.XK.XK_2, KEY_MODMASK)
 KEY_SWITCH_TO_WORKSPACE_2: Tuple[int, int] = (Xlib.XK.XK_3, KEY_MODMASK)
 KEY_SWITCH_TO_WORKSPACE_3: Tuple[int, int] = (Xlib.XK.XK_4, KEY_MODMASK)
 KEY_SPAWN_LAUNCHER: Tuple[int, int] = (Xlib.XK.XK_Return, KEY_MODMASK | Xlib.X.ShiftMask)
+KEY_SPAWN_TASK_SWITCHER: Tuple[int, int] = (Xlib.XK.XK_space, KEY_MODMASK)
 KEY_SPAWN_TERMINAL: Tuple[int, int] = (Xlib.XK.XK_Return, KEY_MODMASK)
-KEY_QUIT: Tuple[int, int] = (Xlib.XK.XK_F1, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_WINDOW_FOCUS_DEC: Tuple[int, int] = (Xlib.XK.XK_Right, KEY_MODMASK)
 KEY_WINDOW_FOCUS_INC: Tuple[int, int] = (Xlib.XK.XK_Left, KEY_MODMASK)
 
@@ -84,6 +94,8 @@ class Workspace:
         self.i_focused_window: int = 0
 
         self.keys: Tuple[Key, ...] = (
+            Key(self.display, KEY_MASTER_FACTOR_DEC, lambda: self.adjust_master_factor(-MASTER_FACTOR_ADJUST_AMOUNT)),
+            Key(self.display, KEY_MASTER_FACTOR_INC, lambda: self.adjust_master_factor(MASTER_FACTOR_ADJUST_AMOUNT)),
             Key(self.display, KEY_PROMOTE_WINDOW, lambda: self.promote_focused_window()),
             Key(self.display, KEY_WINDOW_FOCUS_DEC, lambda: self.change_window_focus(-1)),
             Key(self.display, KEY_WINDOW_FOCUS_INC, lambda: self.change_window_focus(1)),
@@ -128,7 +140,7 @@ class Workspace:
             self.windows.remove(window)
             self.tile_windows()
         if self.is_current_workspace:
-            if window.id == focused_window.id:
+            if window == focused_window:
                 self.focus_window(self.get_master_window())
             else:
                 self.focus_window(focused_window)
@@ -223,10 +235,10 @@ class Task:
             Key(self.display, KEY_MOVE_WINDOW_TO_WORKSPACE_1, lambda: self.move_window_to_workspace(1)),
             Key(self.display, KEY_MOVE_WINDOW_TO_WORKSPACE_2, lambda: self.move_window_to_workspace(2)),
             Key(self.display, KEY_MOVE_WINDOW_TO_WORKSPACE_3, lambda: self.move_window_to_workspace(3)),
-            Key(self.display, KEY_SWITCH_TO_WORKSPACE_0, lambda: self.switch_to_workspace(0)),
-            Key(self.display, KEY_SWITCH_TO_WORKSPACE_1, lambda: self.switch_to_workspace(1)),
-            Key(self.display, KEY_SWITCH_TO_WORKSPACE_2, lambda: self.switch_to_workspace(2)),
-            Key(self.display, KEY_SWITCH_TO_WORKSPACE_3, lambda: self.switch_to_workspace(3)),
+            Key(self.display, KEY_SWITCH_TO_WORKSPACE_0, lambda: self.switch_workspace(0)),
+            Key(self.display, KEY_SWITCH_TO_WORKSPACE_1, lambda: self.switch_workspace(1)),
+            Key(self.display, KEY_SWITCH_TO_WORKSPACE_2, lambda: self.switch_workspace(2)),
+            Key(self.display, KEY_SWITCH_TO_WORKSPACE_3, lambda: self.switch_workspace(3)),
         )
 
     def show(self) -> None:
@@ -237,7 +249,7 @@ class Task:
         self.is_current_task = False
         self.workspaces[self.i_workspace_current].hide()
 
-    def switch_to_workspace(self, i_workspace: int) -> None:
+    def switch_workspace(self, i_workspace: int) -> None:
         if i_workspace == self.i_workspace_current:
             return
 
@@ -281,22 +293,23 @@ class WindowManager:
         self.tasks[self.task_current].show()
 
         self.keys: Tuple[Key, ...] = (
-            Key(self.display, KEY_SPAWN_TERMINAL, lambda: self.spawn_subprocess(CMD_TERMINAL)),
-            Key(self.display, KEY_SPAWN_LAUNCHER, lambda: self.spawn_subprocess(CMD_LAUNCHER)),
             Key(self.display, KEY_QUIT, lambda: self.quit()),
+            Key(self.display, KEY_SPAWN_LAUNCHER, lambda: self.spawn_subprocess(CMD_LAUNCHER)),
+            Key(self.display, KEY_SPAWN_TASK_SWITCHER, lambda: self.spawn_task_switcher()),
+            Key(self.display, KEY_SPAWN_TERMINAL, lambda: self.spawn_subprocess(CMD_TERMINAL)),
         )
 
         self.task_workdirs = TASK_WORKDIRS_DEFAULT
         if ENV_TASK_WORKDIRS in os.environ:
             try:
                 self.task_workdirs = dict(
-                    s.split(":") for s in os.environ[ENV_TASK_WORKDIRS].strip().strip(",").split(",")
+                    s.split(":") for s in "".join(os.environ[ENV_TASK_WORKDIRS].split()).strip(",").split(",")
                 )
             except:
-                print("Error: Failed to parse %s, using defaults." % ENV_TASK_WORKDIRS)
+                print("Error: Failed to parse %s: '%s'" % (ENV_TASK_WORKDIRS, os.environ[ENV_TASK_WORKDIRS]))
 
-    def switch_to_task(self, task_name: str) -> None:
-        if task_name == self.task_current:
+    def switch_task(self, task_name: str) -> None:
+        if not task_name or task_name == self.task_current:
             return
 
         self.tasks[self.task_current].hide()
@@ -306,11 +319,26 @@ class WindowManager:
         self.tasks[self.task_current] = self.tasks.pop(self.task_current, Task(self.display))
         self.tasks[self.task_current].show()
 
-    def spawn_subprocess(self, command: Tuple[str, ...]) -> None:
+    def spawn_subprocess(self, command: str) -> None:
         cwd = self.task_workdirs.get(self.task_current, None)
         env: Dict[str, str] = dict(os.environ)
         env.update({ENV_OUT_TASK_NAME: self.task_current})
-        subprocess.Popen(command, cwd=cwd, env=env)
+        subprocess.Popen((shutil.which(command),), cwd=cwd, env=env)
+
+    def spawn_task_switcher(self) -> None:
+        p1: subprocess.Popen = subprocess.Popen(
+            (shutil.which(CMD_DMENU),), stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        p2: subprocess.Popen = subprocess.Popen(
+            (shutil.which(CMD_TR), "\\n", "\\0"), stdin=p1.stdout, stdout=subprocess.PIPE
+        )
+        p3: subprocess.Popen = subprocess.Popen(
+            (shutil.which(CMD_XARGS), "-0", "-r", shutil.which(CMD_XSETROOT), "-name"), stdin=p2.stdout
+        )
+        p1.stdin.write(("\n".join(reversed(self.tasks.keys()))).encode())
+        p1.stdin.close()
+        p1.stdout.close()
+        p2.stdout.close()
 
     def quit(self) -> None:
         self.is_running = False
@@ -319,20 +347,21 @@ class WindowManager:
         for task in self.tasks.values():
             task._on_event(event)
 
+        if event.type == Xlib.X.PropertyNotify and event.window == self.display.screen().root:
+            self.switch_task(self.display.screen().root.get_wm_name())
         if event.type == Xlib.X.KeyPress:
             for key in self.keys:
                 key._on_event(event)
 
 
 def main(argv: List[str]) -> int:
+    for cmd in CMDS:
+        assert shutil.which(cmd) is not None, "'%s' not found in PATH." % cmd
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     display: Xlib.display.Display = Xlib.display.Display()
-
     window_manager: WindowManager = WindowManager(display)
     while window_manager.is_running:
-        event: Xlib.protocol.rq.Event = display.next_event()
-        # print(event)
-        window_manager._on_event(event)
-
+        window_manager._on_event(display.next_event())
     display.close()
 
     return 0
