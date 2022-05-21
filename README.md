@@ -83,6 +83,14 @@ exec /path/to/gwm.py
 and running `startx` from the tty.
 
 
+### Links
+
+* Main repo: https://github.com/GullikX/gwm
+* Repo mirrors:
+    * https://bitbucket.org/Gullik/gwm
+    * https://git.sr.ht/~gullik/gwm
+
+
 ### Acknowledgments
 
 * gwm is heavily inspired by dwm, written by the Suckless team. Check it out if you haven't: https://dwm.suckless.org
