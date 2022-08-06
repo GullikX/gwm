@@ -21,6 +21,7 @@ import Xlib.X
 import Xlib.XK
 import Xlib.display
 import Xlib.protocol.rq
+import Xlib.xobject.colormap
 import enum
 import os
 from typing import Callable, Dict, List, Optional, Tuple, Type, TypeVar
@@ -39,6 +40,9 @@ MASTER_FACTOR_MIN: float = 0.1
 MASTER_FACTOR_MAX: float = 0.9
 MASTER_FACTOR_ADJUST_AMOUNT: float = 0.05
 N_WORKSPACES: int = 4
+WINDOW_BORDER_WIDTH: int = 2
+WINDOW_BORDER_COLOR_DEFAULT = "#222222"
+WINDOW_BORDER_COLOR_FOCUSED = "#bbbbbb"
 
 CMD_DMENU: str = "dmenu"
 CMD_LAUNCHER: str = "dmenu_run"
@@ -242,6 +246,7 @@ class Tree:
             Key(self._display, KEY_MOVE_WINDOW_TO_NEXT_SCREEN, lambda: self._move_window_to_screen(1)),
         )
         self._root_window: Xlib.protocol.rq.Window = self._display.screen().root
+        self._colormap: Xlib.xobject.colormap.Colormap = self._display.screen().default_colormap
         self.root = Node()
         self._switch_task(TASK_NAME_DEFAULT)
 
@@ -428,7 +433,7 @@ class Tree:
                 stack_windows: List[Window] = windows[:-1]
                 if len(stack_windows) == 0:
                     master_window.get_xlib_window().configure(
-                        x=screen_x, y=screen_y, width=screen_width, height=screen_height
+                        x=screen_x, y=screen_y, width=screen_width, height=screen_height, border_width=0
                     )
                 else:
                     master_window_width: int
@@ -441,14 +446,19 @@ class Tree:
                         stack_window_width = screen_width - master_window_width
                         stack_window_height = screen_height // len(stack_windows)
                         master_window.get_xlib_window().configure(
-                            x=screen_x, y=screen_y, width=master_window_width, height=master_window_height
+                            x=screen_x,
+                            y=screen_y,
+                            width=master_window_width - 2 * WINDOW_BORDER_WIDTH,
+                            height=master_window_height - 2 * WINDOW_BORDER_WIDTH,
+                            border_width=WINDOW_BORDER_WIDTH,
                         )
                         for i, window in enumerate(reversed(stack_windows)):
                             window.get_xlib_window().configure(
                                 x=screen_x + master_window_width,
                                 y=screen_y + i * stack_window_height,
-                                width=stack_window_width,
-                                height=stack_window_height,
+                                width=stack_window_width - 2 * WINDOW_BORDER_WIDTH,
+                                height=stack_window_height - 2 * WINDOW_BORDER_WIDTH,
+                                border_width=WINDOW_BORDER_WIDTH,
                             )
                     else:
                         master_window_width = screen_width
@@ -456,21 +466,33 @@ class Tree:
                         stack_window_width = screen_width // len(stack_windows)
                         stack_window_height = screen_height - master_window_height
                         master_window.get_xlib_window().configure(
-                            x=screen_x, y=screen_y, width=master_window_width, height=master_window_height
+                            x=screen_x,
+                            y=screen_y,
+                            width=master_window_width - 2 * WINDOW_BORDER_WIDTH,
+                            height=master_window_height - 2 * WINDOW_BORDER_WIDTH,
+                            border_width=WINDOW_BORDER_WIDTH,
                         )
                         for i, window in enumerate(reversed(stack_windows)):
                             window.get_xlib_window().configure(
                                 x=screen_x + i * stack_window_width,
                                 y=screen_y + master_window_height,
-                                width=stack_window_width,
-                                height=stack_window_height,
+                                width=stack_window_width - 2 * WINDOW_BORDER_WIDTH,
+                                height=stack_window_height - 2 * WINDOW_BORDER_WIDTH,
+                                border_width=WINDOW_BORDER_WIDTH,
                             )
         self._update_window_focus()
 
     def _update_window_focus(self) -> None:
+        for window in self.root.search_all(Window):
+            window.get_xlib_window().change_attributes(
+                None, border_pixel=self._colormap.alloc_named_color(WINDOW_BORDER_COLOR_DEFAULT).pixel
+            )
         focused_window: Optional[Window] = self.root.search_active(Window)
         if focused_window is not None and self._is_window_valid(focused_window.get_xlib_window()):
             focused_window.get_xlib_window().set_input_focus(Xlib.X.RevertToParent, 0)
+            focused_window.get_xlib_window().change_attributes(
+                None, border_pixel=self._colormap.alloc_named_color(WINDOW_BORDER_COLOR_FOCUSED).pixel
+            )
         else:
             self._root_window.set_input_focus(Xlib.X.RevertToParent, 0)
 
