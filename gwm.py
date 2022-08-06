@@ -23,7 +23,7 @@ import Xlib.display
 import Xlib.protocol.rq
 import enum
 import os
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Type, TypeVar
 import shutil
 import signal
 import subprocess
@@ -69,6 +69,10 @@ KEY_SPAWN_TERMINAL: Tuple[int, int] = (Xlib.XK.XK_Return, KEY_MODMASK)
 KEY_WINDOW_FOCUS_DEC: Tuple[int, int] = (Xlib.XK.XK_Right, KEY_MODMASK)
 KEY_WINDOW_FOCUS_INC: Tuple[int, int] = (Xlib.XK.XK_Left, KEY_MODMASK)
 
+INT16_MAX: int = (1 << 15) - 1
+
+T = TypeVar("T", bound="Node")
+
 
 class Key:
     def __init__(self, display: Xlib.display.Display, key: Tuple[int, int], callback: Callable[[], None]) -> None:
@@ -77,168 +81,130 @@ class Key:
         self._mod_mask: int = key[1]
         self._callback: Callable[[], None] = callback
         self._keycode = self._display.keysym_to_keycode(self._keysym)
-        self._display.screen().root.grab_key(self._keycode, self._mod_mask, 1, Xlib.X.GrabModeAsync, Xlib.X.GrabModeAsync)
+        self._display.screen().root.grab_key(
+            self._keycode, self._mod_mask, 1, Xlib.X.GrabModeAsync, Xlib.X.GrabModeAsync
+        )
 
     def on_event(self, event: Xlib.protocol.rq.Event) -> None:
         if event.detail == self._keycode and event.state == self._mod_mask:
             self._callback()
 
 
-class Workspace:
-    def __init__(self, display: Xlib.display.Display) -> None:
-        self._display: Xlib.display.display = display
-        self._root_window: Xlib.protocol.rq.Window = self._display.screen().root
-        self._is_current_workspace: bool = False
-        self._windows: List[Xlib.protocol.rq.Window] = []
-        self._master_factor: float = MASTER_FACTOR_DEFAULT
-        self._i_focused_window: int = 0
+class Node:
+    def __init__(self: T) -> None:
+        self._children: List[T] = []
+        self._parent: Optional["Node"] = None
+        self._i_active_child: int = 0
 
+    def append(self, child: T) -> None:
+        child._parent = self
+        self._children.append(child)
+
+    def remove(self: T) -> None:
+        if self._parent is not None:
+            active_child = self._parent._children[self._parent._i_active_child]
+            self._parent._children.remove(self)
+            if active_child == self:
+                self._parent._i_active_child = len(self._parent._children) - 1
+            else:
+                self._parent._i_active_child = self._parent._children.index(active_child)
+
+    def get_sibling_by_index(self: T, index: int) -> Optional[T]:
+        if self._parent is None:
+            return None
+        else:
+            try:
+                return self._parent._children[index]
+            except IndexError:
+                return None
+
+    def get_sibling_by_offset(self: T, offset: int) -> Optional[T]:
+        if self._parent is None:
+            return None
+        else:
+            return self._parent._children[(self.get_index() + offset) % len(self._parent._children)]
+
+    def activate(self, promote: bool = False) -> None:
+        if self._parent is not None and promote:
+            self.remove()
+            self._parent.append(self)
+        node: "Node" = self
+        while node._parent is not None:
+            node._parent._i_active_child = node.get_index()
+            node = node._parent
+
+    def search_active(self, cls: Type[T]) -> Optional[T]:
+        if type(self) == cls:
+            return self
+        try:
+            return self._children[self._i_active_child].search_active(cls)
+        except IndexError as e:
+            pass
+        return None
+
+    def search_all(self, cls: Type[T]) -> List[T]:
+        matches: List[T] = []
+        self._search_all_recursive(cls, matches)
+        return matches
+
+    def _search_all_recursive(self, cls: Type[T], matches: List[T]) -> None:
+        if type(self) == cls:
+            matches.append(self)
+        for child in self._children:
+            child._search_all_recursive(cls, matches)
+
+    def get_index(self: T) -> int:
+        if self._parent is None:
+            return 0
+        else:
+            return self._parent._children.index(self)
+
+    def is_highest_index(self) -> bool:
+        if self._parent is None:
+            return False
+        else:
+            return self.get_index() == len(self._parent._children) - 1
+
+
+class Window(Node):
+    def __init__(self, xlib_window: Xlib.protocol.rq.Window) -> None:
+        super().__init__()
+        self._xlib_window = xlib_window
+
+    def get_xlib_window(self) -> Xlib.protocol.rq.Window:
+        return self._xlib_window
+
+
+class Workspace(Node):
+    def __init__(self) -> None:
+        super().__init__()
+        self._master_factor: float = MASTER_FACTOR_DEFAULT
+
+    def get_master_factor(self) -> float:
+        return self._master_factor
+
+    def adjust_master_factor(self, amount: float) -> None:
+        self._master_factor = max(min(self._master_factor + amount, MASTER_FACTOR_MAX), MASTER_FACTOR_MIN)
+
+
+class Task(Node):
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._name: str = name
+
+    def get_name(self) -> str:
+        return self._name
+
+
+class Tree:
+    def __init__(self, display: Xlib.display.Display) -> None:
+        self._display: Xlib.display.Display = display
         self._keys: Tuple[Key, ...] = (
             Key(self._display, KEY_MASTER_FACTOR_DEC, lambda: self._adjust_master_factor(-MASTER_FACTOR_ADJUST_AMOUNT)),
             Key(self._display, KEY_MASTER_FACTOR_INC, lambda: self._adjust_master_factor(MASTER_FACTOR_ADJUST_AMOUNT)),
-            Key(self._display, KEY_PROMOTE_WINDOW, lambda: self._promote_focused_window()),
+            Key(self._display, KEY_PROMOTE_WINDOW, lambda: self._promote_window()),
             Key(self._display, KEY_WINDOW_FOCUS_DEC, lambda: self._focus_window_by_offset(-1)),
             Key(self._display, KEY_WINDOW_FOCUS_INC, lambda: self._focus_window_by_offset(1)),
-        )
-
-    def on_event(self, event: Xlib.protocol.rq.Event) -> None:
-        if event.type == Xlib.X.DestroyNotify:
-            self.remove_window(event.window)
-        elif self._is_current_workspace:
-            if event.type == Xlib.X.MapRequest:
-                self.add_window(event.window)
-            elif event.type == Xlib.X.KeyPress:
-                for key in self._keys:
-                    key.on_event(event)
-
-    def show(self) -> None:
-        self._is_current_workspace = True
-        for window in self._windows:
-            self._show_window(window)
-        self._focus_window(self.get_focused_window())
-
-    def hide(self) -> None:
-        self._focus_window(None)
-        for window in self._windows:
-            self._hide_window(window)
-        self._is_current_workspace = False
-
-    def add_window(self, window: Xlib.protocol.rq.Window) -> None:
-        if window in self._windows or not self._is_window_valid(window):
-            return
-        self._windows.append(window)
-        self._tile_windows()
-        self._show_window(window)
-        self._focus_window(window)
-
-    def remove_window(self, window: Xlib.protocol.rq.Window) -> None:
-        focused_window: Xlib.protocol.rq.Window = self.get_focused_window()
-        if window in self._windows:
-            self._hide_window(window)
-            self._windows.remove(window)
-            self._tile_windows()
-        if window == focused_window:
-            self._focus_window(self._get_master_window())
-        else:
-            self._focus_window(focused_window)
-
-    def get_focused_window(self) -> Xlib.protocol.rq.Window:
-        try:
-            return self._windows[self._i_focused_window]
-        except IndexError:
-            return None
-
-    def get_window_count(self) -> int:
-        return len(self._windows)
-
-    def _focus_window(self, window: Xlib.protocol.rq.Window) -> None:
-        if window in self._windows and self._is_window_valid(window):
-            self._i_focused_window = self._windows.index(window)
-        if self._is_current_workspace:
-            if window in self._windows and self._is_window_valid(window):
-                window.set_input_focus(Xlib.X.RevertToParent, 0)
-            else:
-                self._root_window.set_input_focus(Xlib.X.RevertToParent, 0)
-
-    def _focus_window_by_offset(self, offset: int) -> None:
-        if self.get_window_count() > 0:
-            self._focus_window(self._windows[(self._i_focused_window + offset) % self.get_window_count()])
-        else:
-            self._focus_window(None)
-
-    def _show_window(self, window: Xlib.protocol.rq.Window) -> None:
-        if self._is_current_workspace and window in self._windows and self._is_window_valid(window):
-            window.map()
-
-    def _hide_window(self, window: Xlib.protocol.rq.Window) -> None:
-        if self._is_current_workspace and window in self._windows and self._is_window_valid(window):
-            window.unmap()
-
-    def _promote_focused_window(self) -> None:
-        focused_window: Xlib.protocol.rq.Window = self.get_focused_window()
-        master_window: Xlib.protocol.rq.Window = self._get_master_window()
-        if focused_window is not None:
-            if focused_window is not master_window:
-                self.remove_window(focused_window)
-                self.add_window(focused_window)
-            else:
-                stack_windows: List[Xlib.protocol.rq.Window] = self._get_stack_windows()
-                try:
-                    self.remove_window(stack_windows[0])
-                    self.add_window(stack_windows[0])
-                except IndexError:
-                    pass
-
-    def _tile_windows(self) -> None:
-        i_screen: int = 0  # TODO: Multi-monitor support
-        screen_x: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["x"]
-        screen_y: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["y"]
-        screen_width: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["width"]
-        screen_height: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["height"]
-
-        master_window: Xlib.protocol.rq.Window = self._get_master_window()
-        if master_window is not None:
-            stack_windows: List[Xlib.protocol.rq.Window] = self._get_stack_windows()
-            if len(stack_windows) == 0:
-                master_window.configure(x=screen_x, y=screen_y, width=screen_width, height=screen_height)
-            else:
-                master_window_width: int = int(screen_width * self._master_factor)
-                stack_window_width: int = screen_width - master_window_width
-                stack_window_height: int = screen_height // len(stack_windows)
-                master_window.configure(x=screen_x, y=screen_y, width=master_window_width, height=screen_height)
-                for i, window in enumerate(reversed(stack_windows)):
-                    window.configure(
-                        x=screen_x + master_window_width,
-                        y=screen_y + i * stack_window_height,
-                        width=stack_window_width,
-                        height=stack_window_height,
-                    )
-
-    def _adjust_master_factor(self, amount: float) -> None:
-        self._master_factor = max(min(self._master_factor + amount, MASTER_FACTOR_MAX), MASTER_FACTOR_MIN)
-        self._tile_windows()
-
-    def _get_master_window(self) -> Xlib.protocol.rq.Window:
-        try:
-            return self._windows[-1]
-        except IndexError:
-            return None
-
-    def _get_stack_windows(self) -> List[Xlib.protocol.rq.Window]:
-        return self._windows[:-1]
-
-    def _is_window_valid(self, window: Xlib.protocol.rq.Window) -> bool:
-        return window in self._root_window.query_tree().children
-
-
-class Task:
-    def __init__(self, display: Xlib.display.Display) -> None:
-        self._display: Xlib.display.display = display
-        self._is_current_task: bool = False
-        self._workspaces: List[Workspace] = [Workspace(display) for i in range(N_WORKSPACES)]
-        self._i_workspace_current: int = 0
-
-        self.keys: Tuple[Key, ...] = (
             Key(self._display, KEY_MOVE_WINDOW_TO_WORKSPACE_0, lambda: self._move_window_to_workspace(0)),
             Key(self._display, KEY_MOVE_WINDOW_TO_WORKSPACE_1, lambda: self._move_window_to_workspace(1)),
             Key(self._display, KEY_MOVE_WINDOW_TO_WORKSPACE_2, lambda: self._move_window_to_workspace(2)),
@@ -248,56 +214,184 @@ class Task:
             Key(self._display, KEY_SWITCH_TO_WORKSPACE_2, lambda: self._switch_workspace(2)),
             Key(self._display, KEY_SWITCH_TO_WORKSPACE_3, lambda: self._switch_workspace(3)),
         )
+        self._root_window: Xlib.protocol.rq.Window = self._display.screen().root
+        self.root = Node()
+        self._switch_task(TASK_NAME_DEFAULT)
 
     def on_event(self, event: Xlib.protocol.rq.Event) -> None:
-        for workspace in self._workspaces:
-            workspace.on_event(event)
+        if event.type == Xlib.X.PropertyNotify:
+            if event.window == self._root_window:
+                name: Optional[str] = self._root_window.get_wm_name()
+                if name:
+                    self._switch_task(name)
+        elif event.type == Xlib.X.MapRequest:
+            self._handle_window(event.window)
+        elif event.type == Xlib.X.UnmapNotify:
+            self._unhandle_window(event.window)
+        elif event.type == Xlib.X.KeyPress:
+            for key in self._keys:
+                key.on_event(event)
 
-        if self._is_current_task:
-            if event.type == Xlib.X.KeyPress:
-                for key in self.keys:
-                    key.on_event(event)
+    def get_active_task_name(self) -> str:
+        task: Optional[Task] = self.root.search_active(Task)
+        assert task is not None, "No active task?"
+        return task.get_name()
 
-    def show(self) -> None:
-        self._is_current_task = True
-        self._workspaces[self._i_workspace_current].show()
+    def get_all_task_names(self) -> List[str]:
+        return [task.get_name() for task in self.root.search_all(Task)]
 
-    def hide(self) -> None:
-        self._is_current_task = False
-        self._workspaces[self._i_workspace_current].hide()
-
-    def get_window_count(self) -> int:
-        return sum(workspace.get_window_count() for workspace in self._workspaces)
+    def _switch_task(self, name: str) -> None:
+        task_previous: Optional[Task] = self.root.search_active(Task)
+        if task_previous is None or name != task_previous.get_name():
+            task: Optional[Task] = None
+            try:
+                tasks: List[Task] = self.root.search_all(Task)
+                for t in tasks:
+                    if t.get_name() == name:
+                        task = t
+            except IndexError:
+                pass
+            if task is None:
+                task = Task(name)
+                for i in range(N_WORKSPACES):
+                    task.append(Workspace())
+                self.root.append(task)
+            if task_previous is not None and len(task_previous.search_all(Window)) == 0:
+                task_previous.remove()
+            task.activate(promote=True)
+            self._update_window_positions()
 
     def _switch_workspace(self, i_workspace: int) -> None:
-        if i_workspace == self._i_workspace_current:
-            return
-        self._workspaces[self._i_workspace_current].hide()
-        self._i_workspace_current = i_workspace
-        self._workspaces[self._i_workspace_current].show()
+        workspace: Optional[Workspace] = self.root.search_active(Workspace)
+        assert workspace is not None, "No active workspace?"
+        if i_workspace != workspace.get_index():
+            workspace_new: Optional[Workspace] = workspace.get_sibling_by_index(i_workspace)
+            assert workspace_new is not None, "Unable to find workspace?"
+            workspace_new.activate()
+            self._update_window_positions()
 
     def _move_window_to_workspace(self, i_workspace: int) -> None:
-        if i_workspace == self._i_workspace_current:
+        workspace: Optional[Workspace] = self.root.search_active(Workspace)
+        assert workspace is not None, "No active workspace?"
+        if i_workspace != workspace.get_index():
+            window: Optional[Window] = self.root.search_active(Window)
+            if window is not None:
+                window.remove()
+                workspace_new: Optional[Workspace] = workspace.get_sibling_by_index(i_workspace)
+                assert workspace_new is not None, "Unable to find workspace?"
+                workspace_new.append(window)
+                self._update_window_positions()
+
+    def _handle_window(self, xlib_window: Xlib.protocol.rq.Window) -> None:
+        if not self._is_window_valid(xlib_window):
             return
-        window: Xlib.protocol.rq.Window = self._workspaces[self._i_workspace_current].get_focused_window()
-        self._workspaces[self._i_workspace_current].remove_window(window)
-        self._workspaces[i_workspace].add_window(window)
+
+        workspace: Optional[Workspace] = self.root.search_active(Workspace)
+        assert workspace is not None, "No active workspace?"
+        window: Window = Window(xlib_window)
+        workspace.append(window)
+        window.activate()
+        self._update_window_positions()
+
+    def _unhandle_window(self, xlib_window: Xlib.protocol.rq.Window) -> None:
+        for window in self.root.search_all(Window):
+            if window.get_xlib_window() == xlib_window:
+                window.remove()
+                self._update_window_positions()
+
+    def _focus_window_by_offset(self, offset: int) -> None:
+        window: Optional[Window] = self.root.search_active(Window)
+        if window is not None:
+            window_new: Optional[Window] = window.get_sibling_by_offset(offset)
+            if window_new is not None:
+                window_new.activate()
+                self._update_window_focus()
+
+    def _promote_window(self) -> None:
+        window_focused: Optional[Window] = self.root.search_active(Window)
+        if window_focused is not None:
+            if not window_focused.is_highest_index():
+                window_focused.activate(promote=True)
+                self._update_window_positions()
+            else:
+                workspace: Optional[Workspace] = self.root.search_active(Workspace)
+                assert workspace is not None, "No active workspace?"
+                for window in reversed(workspace.search_all(Window)):
+                    if window != window_focused:
+                        window.activate(promote=True)
+                        self._update_window_positions()
+                        break
+
+    def _update_window_positions(self) -> None:
+        windows_all: List[Window] = self.root.search_all(Window)
+        for window in windows_all:
+            position_hidden: int = INT16_MAX
+            window.get_xlib_window().configure(x=position_hidden, y=position_hidden)
+            window.get_xlib_window().map()
+
+        i_screen: int = 0  # TODO: Multi-monitor support
+        screen_x: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["x"]
+        screen_y: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["y"]
+        screen_width: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["width"]
+        screen_height: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["height"]
+
+        workspace: Optional[Workspace] = self.root.search_active(Workspace)
+        assert workspace is not None, "No active workspace?"
+        windows: List[Window] = workspace.search_all(Window)
+
+        if len(windows) > 0:
+            master_window: Window = windows[-1]
+            stack_windows: List[Window] = windows[:-1]
+            if len(stack_windows) == 0:
+                master_window.get_xlib_window().configure(
+                    x=screen_x, y=screen_y, width=screen_width, height=screen_height
+                )
+            else:
+                master_window_width: int = int(screen_width * workspace.get_master_factor())
+                stack_window_width: int = screen_width - master_window_width
+                stack_window_height: int = screen_height // len(stack_windows)
+                master_window.get_xlib_window().configure(
+                    x=screen_x, y=screen_y, width=master_window_width, height=screen_height
+                )
+                for i, window in enumerate(reversed(stack_windows)):
+                    window.get_xlib_window().configure(
+                        x=screen_x + master_window_width,
+                        y=screen_y + i * stack_window_height,
+                        width=stack_window_width,
+                        height=stack_window_height,
+                    )
+
+        self._update_window_focus()
+
+    def _update_window_focus(self) -> None:
+        focused_window: Optional[Window] = self.root.search_active(Window)
+        if focused_window is not None and self._is_window_valid(focused_window.get_xlib_window()):
+            focused_window.get_xlib_window().set_input_focus(Xlib.X.RevertToParent, 0)
+        else:
+            self._root_window.set_input_focus(Xlib.X.RevertToParent, 0)
+
+    def _adjust_master_factor(self, amount: float) -> None:
+        workspace: Optional[Workspace] = self.root.search_active(Workspace)
+        assert workspace is not None, "No active workspace?"
+        workspace.adjust_master_factor(amount)
+        self._update_window_positions()
+
+    def _is_window_valid(self, xlib_window: Xlib.protocol.rq.Window) -> bool:
+        return xlib_window in self._root_window.query_tree().children
 
 
 class WindowManager:
-    def __init__(self, display: Xlib.display.Display) -> None:
+    def __init__(self, display: Xlib.display.Display, cmds: Dict[str, str]) -> None:
         self._display: Xlib.display.Display = display
-        self._root_window: Xlib.protocol.rq.Window = self._display.screen().root
+        self._cmds = cmds
 
+        self._root_window: Xlib.protocol.rq.Window = self._display.screen().root
         self._root_window.change_attributes(
             event_mask=Xlib.X.PropertyChangeMask | Xlib.X.SubstructureNotifyMask | Xlib.X.SubstructureRedirectMask
         )
 
-        self._is_running = True
-        self._tasks: Dict[str, Task] = {}
-        self._task_current: str = TASK_NAME_DEFAULT
-        self._tasks[self._task_current] = Task(display)
-        self._tasks[self._task_current].show()
+        self._is_running: bool = True
+        self._tree: Tree = Tree(self._display)
 
         self._keys: Tuple[Key, ...] = (
             Key(self._display, KEY_QUIT, lambda: self._quit()),
@@ -316,62 +410,53 @@ class WindowManager:
                 print("Error: Failed to parse %s: '%s'" % (ENV_TASK_WORKDIRS, os.environ[ENV_TASK_WORKDIRS]))
 
     def on_event(self, event: Xlib.protocol.rq.Event) -> None:
-        for task in self._tasks.values():
-            task.on_event(event)
+        self._tree.on_event(event)
 
-        if event.type == Xlib.X.PropertyNotify and event.window == self._root_window:
-            self._switch_task(self._root_window.get_wm_name())
-        elif event.type == Xlib.X.KeyPress:
+        if event.type == Xlib.X.KeyPress:
             for key in self._keys:
                 key.on_event(event)
 
     def is_running(self) -> bool:
         return self._is_running
 
-    def _switch_task(self, task_name: str) -> None:
-        if not task_name or task_name == self._task_current:
-            return
-        self._tasks[self._task_current].hide()
-        if self._tasks[self._task_current].get_window_count() == 0:
-            self._tasks.pop(self._task_current)
-        self._task_current = task_name
-        self._tasks[self._task_current] = self._tasks.pop(self._task_current, Task(self._display))
-        self._tasks[self._task_current].show()
-
     def _spawn_subprocess(self, command: str) -> None:
         env: Dict[str, str] = dict(os.environ)
-        env.update({ENV_OUT_TASK_NAME: self._task_current})
-        cwd = self._task_workdirs.get(self._task_current, None)
+        env.update({ENV_OUT_TASK_NAME: self._tree.get_active_task_name()})
+        cwd = self._task_workdirs.get(self._tree.get_active_task_name(), None)
         if cwd is not None and os.path.isdir(cwd):
-            subprocess.Popen((shutil.which(command),), cwd=cwd, env=env)
+            subprocess.Popen((self._cmds[command],), cwd=cwd, env=env)
         else:
-            subprocess.Popen((shutil.which(command),), env=env)
+            subprocess.Popen((self._cmds[command],), env=env)
 
     def _spawn_task_switcher(self) -> None:
-        p1: subprocess.Popen = subprocess.Popen(
-            (shutil.which(CMD_DMENU),), stdin=subprocess.PIPE, stdout=subprocess.PIPE
-        )
+        p1: subprocess.Popen = subprocess.Popen((self._cmds[CMD_DMENU],), stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         p2: subprocess.Popen = subprocess.Popen(
-            (shutil.which(CMD_TR), "\\n", "\\0"), stdin=p1.stdout, stdout=subprocess.PIPE
+            (self._cmds[CMD_TR], "\\n", "\\0"), stdin=p1.stdout, stdout=subprocess.PIPE
         )
         p3: subprocess.Popen = subprocess.Popen(
-            (shutil.which(CMD_XARGS), "-0", "-r", shutil.which(CMD_XSETROOT), "-name"), stdin=p2.stdout
+            (self._cmds[CMD_XARGS], "-0", "-r", self._cmds[CMD_XSETROOT], "-name"), stdin=p2.stdout
         )
-        p1.stdin.write(("\n".join(reversed(self._tasks.keys()))).encode())
-        p1.stdin.close()
-        p1.stdout.close()
-        p2.stdout.close()
+        if p1.stdin is not None:
+            p1.stdin.write(("\n".join(reversed(self._tree.get_all_task_names()))).encode())
+            p1.stdin.close()
+        if p1.stdout is not None:
+            p1.stdout.close()
+        if p2.stdout is not None:
+            p2.stdout.close()
 
     def _quit(self) -> None:
         self._is_running = False
 
 
 def main() -> None:
+    cmds: Dict[str, str] = {}
     for cmd in CMDS:
-        assert shutil.which(cmd) is not None, "'%s' not found in PATH." % cmd
+        path: Optional[str] = shutil.which(cmd)
+        assert path is not None, "'%s' not found in PATH." % cmd
+        cmds[cmd] = path
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     display: Xlib.display.Display = Xlib.display.Display()
-    window_manager: WindowManager = WindowManager(display)
+    window_manager: WindowManager = WindowManager(display, cmds)
     while window_manager.is_running():
         window_manager.on_event(display.next_event())
     display.close()
