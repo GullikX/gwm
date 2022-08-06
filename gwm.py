@@ -69,6 +69,10 @@ KEY_SPAWN_TERMINAL: Tuple[int, int] = (Xlib.XK.XK_Return, KEY_MODMASK)
 KEY_MOVE_WINDOW_TO_TASK: Tuple[int, int] = (Xlib.XK.XK_space, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_WINDOW_FOCUS_DEC: Tuple[int, int] = (Xlib.XK.XK_Right, KEY_MODMASK)
 KEY_WINDOW_FOCUS_INC: Tuple[int, int] = (Xlib.XK.XK_Left, KEY_MODMASK)
+KEY_SCREEN_FOCUS_DEC: Tuple[int, int] = (Xlib.XK.XK_Page_Down, KEY_MODMASK)
+KEY_SCREEN_FOCUS_INC: Tuple[int, int] = (Xlib.XK.XK_Page_Up, KEY_MODMASK)
+KEY_MOVE_WINDOW_TO_PREVIOUS_SCREEN: Tuple[int, int] = (Xlib.XK.XK_Page_Up, KEY_MODMASK | Xlib.X.ShiftMask)
+KEY_MOVE_WINDOW_TO_NEXT_SCREEN: Tuple[int, int] = (Xlib.XK.XK_Page_Down, KEY_MODMASK | Xlib.X.ShiftMask)
 
 INT16_MAX: int = (1 << 15) - 1
 TASK_WINDOW_MOVE_MARKER = "TASK_WINDOW_MOVE_MARKER"
@@ -122,9 +126,9 @@ class Node:
             except IndexError:
                 return None
 
-    def get_sibling_by_offset(self: T, offset: int) -> Optional[T]:
+    def get_sibling_by_offset(self: T, offset: int) -> T:
         if self._parent is None:
-            return None
+            return self
         else:
             return self._parent._children[(self.get_index() + offset) % len(self._parent._children)]
 
@@ -169,6 +173,16 @@ class Node:
         else:
             return self.get_index() == len(self._parent._children) - 1
 
+    def __str__(self) -> str:
+        data: List[str] = []
+        self._str_recursive(data, 0)
+        return "\n".join(data)
+
+    def _str_recursive(self, data: List[str], indent: int) -> None:
+        data.append(indent * " " + self.__repr__())
+        for child in self._children:
+            child._str_recursive(data, indent + 1)
+
 
 class Window(Node):
     def __init__(self, xlib_window: Xlib.protocol.rq.Window) -> None:
@@ -189,6 +203,11 @@ class Workspace(Node):
 
     def adjust_master_factor(self, amount: float) -> None:
         self._master_factor = max(min(self._master_factor + amount, MASTER_FACTOR_MAX), MASTER_FACTOR_MIN)
+
+
+class Screen(Node):
+    def __init__(self) -> None:
+        super().__init__()
 
 
 class Task(Node):
@@ -217,6 +236,10 @@ class Tree:
             Key(self._display, KEY_SWITCH_TO_WORKSPACE_1, lambda: self._switch_workspace(1)),
             Key(self._display, KEY_SWITCH_TO_WORKSPACE_2, lambda: self._switch_workspace(2)),
             Key(self._display, KEY_SWITCH_TO_WORKSPACE_3, lambda: self._switch_workspace(3)),
+            Key(self._display, KEY_SCREEN_FOCUS_DEC, lambda: self._focus_screen_by_offset(-1)),
+            Key(self._display, KEY_SCREEN_FOCUS_INC, lambda: self._focus_screen_by_offset(1)),
+            Key(self._display, KEY_MOVE_WINDOW_TO_PREVIOUS_SCREEN, lambda: self._move_window_to_screen(-1)),
+            Key(self._display, KEY_MOVE_WINDOW_TO_NEXT_SCREEN, lambda: self._move_window_to_screen(1)),
         )
         self._root_window: Xlib.protocol.rq.Window = self._display.screen().root
         self.root = Node()
@@ -249,8 +272,11 @@ class Tree:
 
     def _create_task(self, name: str) -> Task:
         task = Task(name)
-        for i in range(N_WORKSPACES):
-            task.append(Workspace())
+        for i_screen in range(self._get_screen_count()):
+            screen: Screen = Screen()
+            for i_workspace in range(N_WORKSPACES):
+                screen.append(Workspace())
+            task.append(screen)
         self.root.append(task)
         return task
 
@@ -295,6 +321,19 @@ class Tree:
                 task_previous.activate(promote=True)
                 self._update_window_positions()
 
+    def _move_window_to_screen(self, offset: int) -> None:
+        screen_previous: Optional[Screen] = self.root.search_active(Screen)
+        assert screen_previous is not None, "No active screen?"
+        screen_new: Screen = screen_previous.get_sibling_by_offset(offset)
+        if screen_new != screen_previous:
+            window: Optional[Window] = self.root.search_active(Window)
+            if window is not None:
+                window.remove()
+                workspace_new: Optional[Workspace] = screen_new.search_active(Workspace)
+                assert workspace_new is not None, "Unable to find workspace?"
+                workspace_new.append(window, set_active=True)
+                self._update_window_positions()
+
     def _switch_workspace(self, i_workspace: int) -> None:
         workspace: Optional[Workspace] = self.root.search_active(Workspace)
         assert workspace is not None, "No active workspace?"
@@ -336,10 +375,9 @@ class Tree:
     def _focus_window_by_offset(self, offset: int) -> None:
         window: Optional[Window] = self.root.search_active(Window)
         if window is not None:
-            window_new: Optional[Window] = window.get_sibling_by_offset(offset)
-            if window_new is not None:
-                window_new.activate()
-                self._update_window_focus()
+            window_new: Window = window.get_sibling_by_offset(offset)
+            window_new.activate()
+            self._update_window_focus()
 
     def _promote_window(self) -> None:
         window_focused: Optional[Window] = self.root.search_active(Window)
@@ -367,38 +405,66 @@ class Tree:
             window.get_xlib_window().configure(x=position_hidden, y=position_hidden)
             window.get_xlib_window().map()
 
-        i_screen: int = 0  # TODO: Multi-monitor support
-        screen_x: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["x"]
-        screen_y: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["y"]
-        screen_width: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["width"]
-        screen_height: int = self._display.xinerama_query_screens()._data["screens"][i_screen]["height"]
+        task: Optional[Task] = self.root.search_active(Task)
+        assert task is not None, "No active task?"
 
-        workspace: Optional[Workspace] = self.root.search_active(Workspace)
-        assert workspace is not None, "No active workspace?"
-        windows: List[Window] = workspace.search_all(Window)
+        screens: List[Screen] = task.search_all(Screen)
+        assert len(screens) > 0, "No screens found?"
+        assert len(screens) <= self._get_screen_count(), "Windows on non-existent screen?"
 
-        if len(windows) > 0:
-            master_window: Window = windows[-1]
-            stack_windows: List[Window] = windows[:-1]
-            if len(stack_windows) == 0:
-                master_window.get_xlib_window().configure(
-                    x=screen_x, y=screen_y, width=screen_width, height=screen_height
-                )
-            else:
-                master_window_width: int = int(screen_width * workspace.get_master_factor())
-                stack_window_width: int = screen_width - master_window_width
-                stack_window_height: int = screen_height // len(stack_windows)
-                master_window.get_xlib_window().configure(
-                    x=screen_x, y=screen_y, width=master_window_width, height=screen_height
-                )
-                for i, window in enumerate(reversed(stack_windows)):
-                    window.get_xlib_window().configure(
-                        x=screen_x + master_window_width,
-                        y=screen_y + i * stack_window_height,
-                        width=stack_window_width,
-                        height=stack_window_height,
+        for i_screen, screen in enumerate(screens):
+            workspace: Optional[Workspace] = screen.search_active(Workspace)
+            assert workspace is not None, "No active workspace?"
+
+            screen_x: int = self._get_screen_data(i_screen, "x")
+            screen_y: int = self._get_screen_data(i_screen, "y")
+            screen_width: int = self._get_screen_data(i_screen, "width")
+            screen_height: int = self._get_screen_data(i_screen, "height")
+
+            windows: List[Window] = workspace.search_all(Window)
+
+            if len(windows) > 0:
+                master_window: Window = windows[-1]
+                stack_windows: List[Window] = windows[:-1]
+                if len(stack_windows) == 0:
+                    master_window.get_xlib_window().configure(
+                        x=screen_x, y=screen_y, width=screen_width, height=screen_height
                     )
-
+                else:
+                    master_window_width: int
+                    master_window_height: int
+                    stack_window_width: int
+                    stack_window_height: int
+                    if screen_width > screen_height:
+                        master_window_width = int(screen_width * workspace.get_master_factor())
+                        master_window_height = screen_height
+                        stack_window_width = screen_width - master_window_width
+                        stack_window_height = screen_height // len(stack_windows)
+                        master_window.get_xlib_window().configure(
+                            x=screen_x, y=screen_y, width=master_window_width, height=master_window_height
+                        )
+                        for i, window in enumerate(reversed(stack_windows)):
+                            window.get_xlib_window().configure(
+                                x=screen_x + master_window_width,
+                                y=screen_y + i * stack_window_height,
+                                width=stack_window_width,
+                                height=stack_window_height,
+                            )
+                    else:
+                        master_window_width = screen_width
+                        master_window_height = int(screen_height * workspace.get_master_factor())
+                        stack_window_width = screen_width // len(stack_windows)
+                        stack_window_height = screen_height - master_window_height
+                        master_window.get_xlib_window().configure(
+                            x=screen_x, y=screen_y, width=master_window_width, height=master_window_height
+                        )
+                        for i, window in enumerate(reversed(stack_windows)):
+                            window.get_xlib_window().configure(
+                                x=screen_x + i * stack_window_width,
+                                y=screen_y + master_window_height,
+                                width=stack_window_width,
+                                height=stack_window_height,
+                            )
         self._update_window_focus()
 
     def _update_window_focus(self) -> None:
@@ -414,8 +480,21 @@ class Tree:
         workspace.adjust_master_factor(amount)
         self._update_window_positions()
 
+    def _focus_screen_by_offset(self, offset: int) -> None:
+        screen: Optional[Screen] = self.root.search_active(Screen)
+        assert screen is not None, "No active screen?"
+        screen_new: Screen = screen.get_sibling_by_offset(offset)
+        screen_new.activate()
+        self._update_window_focus()
+
     def _is_window_valid(self, xlib_window: Xlib.protocol.rq.Window) -> bool:
         return xlib_window in self._root_window.query_tree().children
+
+    def _get_screen_count(self) -> int:
+        return len(self._display.xinerama_query_screens()._data["screens"])
+
+    def _get_screen_data(self, i_screen: int, data: str) -> int:
+        return int(self._display.xinerama_query_screens()._data["screens"][i_screen][data])
 
 
 class WindowManager:
