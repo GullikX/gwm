@@ -66,10 +66,12 @@ KEY_SWITCH_TO_WORKSPACE_3: Tuple[int, int] = (Xlib.XK.XK_4, KEY_MODMASK)
 KEY_SPAWN_LAUNCHER: Tuple[int, int] = (Xlib.XK.XK_d, KEY_MODMASK)
 KEY_SPAWN_TASK_SWITCHER: Tuple[int, int] = (Xlib.XK.XK_space, KEY_MODMASK)
 KEY_SPAWN_TERMINAL: Tuple[int, int] = (Xlib.XK.XK_Return, KEY_MODMASK)
+KEY_MOVE_WINDOW_TO_TASK: Tuple[int, int] = (Xlib.XK.XK_space, KEY_MODMASK | Xlib.X.ShiftMask)
 KEY_WINDOW_FOCUS_DEC: Tuple[int, int] = (Xlib.XK.XK_Right, KEY_MODMASK)
 KEY_WINDOW_FOCUS_INC: Tuple[int, int] = (Xlib.XK.XK_Left, KEY_MODMASK)
 
 INT16_MAX: int = (1 << 15) - 1
+TASK_WINDOW_MOVE_MARKER = "TASK_WINDOW_MOVE_MARKER"
 
 T = TypeVar("T", bound="Node")
 
@@ -96,9 +98,11 @@ class Node:
         self._parent: Optional["Node"] = None
         self._i_active_child: int = 0
 
-    def append(self, child: T) -> None:
+    def append(self, child: T, set_active: bool = False) -> None:
         child._parent = self
         self._children.append(child)
+        if set_active:
+            self._i_active_child = len(self._children) - 1
 
     def remove(self: T) -> None:
         if self._parent is not None:
@@ -223,7 +227,10 @@ class Tree:
             if event.window == self._root_window:
                 name: Optional[str] = self._root_window.get_wm_name()
                 if name:
-                    self._switch_task(name)
+                    if name.startswith(TASK_WINDOW_MOVE_MARKER):
+                        self._move_window_to_task(name.lstrip(TASK_WINDOW_MOVE_MARKER))
+                    else:
+                        self._switch_task(name)
         elif event.type == Xlib.X.MapRequest:
             self._handle_window(event.window)
         elif event.type == Xlib.X.UnmapNotify:
@@ -240,26 +247,53 @@ class Tree:
     def get_all_task_names(self) -> List[str]:
         return [task.get_name() for task in self.root.search_all(Task)]
 
+    def _create_task(self, name: str) -> Task:
+        task = Task(name)
+        for i in range(N_WORKSPACES):
+            task.append(Workspace())
+        self.root.append(task)
+        return task
+
     def _switch_task(self, name: str) -> None:
         task_previous: Optional[Task] = self.root.search_active(Task)
         if task_previous is None or name != task_previous.get_name():
-            task: Optional[Task] = None
+            task_new: Optional[Task] = None
             try:
                 tasks: List[Task] = self.root.search_all(Task)
-                for t in tasks:
-                    if t.get_name() == name:
-                        task = t
+                for task in tasks:
+                    if task.get_name() == name:
+                        task_new = task
             except IndexError:
                 pass
-            if task is None:
-                task = Task(name)
-                for i in range(N_WORKSPACES):
-                    task.append(Workspace())
-                self.root.append(task)
+            if task_new is None:
+                task_new = self._create_task(name)
             if task_previous is not None and len(task_previous.search_all(Window)) == 0:
                 task_previous.remove()
-            task.activate(promote=True)
+            task_new.activate(promote=True)
             self._update_window_positions()
+
+    def _move_window_to_task(self, name: str) -> None:
+        task_previous: Optional[Task] = self.root.search_active(Task)
+        assert task_previous is not None, "No active task?"
+        if task_previous.get_name() != name:
+            window: Optional[Window] = self.root.search_active(Window)
+            if window is not None:
+                window.remove()
+                task_new: Optional[Task] = None
+                try:
+                    tasks: List[Task] = self.root.search_all(Task)
+                    for task in tasks:
+                        if task.get_name() == name:
+                            task_new = task
+                except IndexError:
+                    pass
+                if task_new is None:
+                    task_new = self._create_task(name)
+                workspace_new: Optional[Workspace] = task_new.search_active(Workspace)
+                assert workspace_new is not None, "Unable to find workspace?"
+                workspace_new.append(window, set_active=True)
+                task_previous.activate(promote=True)
+                self._update_window_positions()
 
     def _switch_workspace(self, i_workspace: int) -> None:
         workspace: Optional[Workspace] = self.root.search_active(Workspace)
@@ -279,7 +313,7 @@ class Tree:
                 window.remove()
                 workspace_new: Optional[Workspace] = workspace.get_sibling_by_index(i_workspace)
                 assert workspace_new is not None, "Unable to find workspace?"
-                workspace_new.append(window)
+                workspace_new.append(window, set_active=True)
                 self._update_window_positions()
 
     def _handle_window(self, xlib_window: Xlib.protocol.rq.Window) -> None:
@@ -289,7 +323,7 @@ class Tree:
         workspace: Optional[Workspace] = self.root.search_active(Workspace)
         assert workspace is not None, "No active workspace?"
         window: Window = Window(xlib_window)
-        workspace.append(window)
+        workspace.append(window, set_active=True)
         window.activate()
         self._update_window_positions()
 
@@ -324,6 +358,10 @@ class Tree:
 
     def _update_window_positions(self) -> None:
         windows_all: List[Window] = self.root.search_all(Window)
+        window_ids: List[int] = [window.get_xlib_window().id for window in windows_all]
+        duplicates: List[int] = [i for i in window_ids if window_ids.count(i) > 1]
+        assert len(duplicates) == 0, "Duplicate windows?"
+
         for window in windows_all:
             position_hidden: int = INT16_MAX
             window.get_xlib_window().configure(x=position_hidden, y=position_hidden)
@@ -398,6 +436,7 @@ class WindowManager:
             Key(self._display, KEY_SPAWN_LAUNCHER, lambda: self._spawn_subprocess(CMD_LAUNCHER)),
             Key(self._display, KEY_SPAWN_TASK_SWITCHER, lambda: self._spawn_task_switcher()),
             Key(self._display, KEY_SPAWN_TERMINAL, lambda: self._spawn_subprocess(CMD_TERMINAL)),
+            Key(self._display, KEY_MOVE_WINDOW_TO_TASK, lambda: self._spawn_task_switcher(move_window=True)),
         )
 
         self._task_workdirs = TASK_WORKDIRS_DEFAULT
@@ -428,13 +467,15 @@ class WindowManager:
         else:
             subprocess.Popen((self._cmds[command],), env=env)
 
-    def _spawn_task_switcher(self) -> None:
+    def _spawn_task_switcher(self, move_window: bool = False) -> None:
+        window_move_marker: str = TASK_WINDOW_MOVE_MARKER if move_window else ""
         p1: subprocess.Popen = subprocess.Popen((self._cmds[CMD_DMENU],), stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         p2: subprocess.Popen = subprocess.Popen(
             (self._cmds[CMD_TR], "\\n", "\\0"), stdin=p1.stdout, stdout=subprocess.PIPE
         )
         p3: subprocess.Popen = subprocess.Popen(
-            (self._cmds[CMD_XARGS], "-0", "-r", self._cmds[CMD_XSETROOT], "-name"), stdin=p2.stdout
+            (self._cmds[CMD_XARGS], "-0", "-r", "-I{}", self._cmds[CMD_XSETROOT], "-name", f"{window_move_marker}{{}}"),
+            stdin=p2.stdout,
         )
         if p1.stdin is not None:
             p1.stdin.write(("\n".join(reversed(self._tree.get_all_task_names()))).encode())
