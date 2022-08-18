@@ -364,11 +364,15 @@ class Tree:
         if not self._is_window_valid(xlib_window):
             return
 
+        for window in self.root.search_all(Window):
+            if window.get_xlib_window() == xlib_window:
+                return  # Already exists
+
         workspace: Optional[Workspace] = self.root.search_active(Workspace)
         assert workspace is not None, "No active workspace?"
-        window: Window = Window(xlib_window)
-        workspace.append(window, set_active=True)
-        window.activate()
+        window_new: Window = Window(xlib_window)
+        workspace.append(window_new, set_active=True)
+        window_new.activate()
         self._update_window_positions()
 
     def _unhandle_window(self, xlib_window: Xlib.protocol.rq.Window) -> None:
