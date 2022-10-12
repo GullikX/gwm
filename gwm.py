@@ -75,8 +75,8 @@ KEY_WINDOW_FOCUS_DEC: Tuple[int, int] = (Xlib.XK.XK_Right, KEY_MODMASK)
 KEY_WINDOW_FOCUS_INC: Tuple[int, int] = (Xlib.XK.XK_Left, KEY_MODMASK)
 KEY_SCREEN_FOCUS_DEC: Tuple[int, int] = (Xlib.XK.XK_Page_Down, KEY_MODMASK)
 KEY_SCREEN_FOCUS_INC: Tuple[int, int] = (Xlib.XK.XK_Page_Up, KEY_MODMASK)
-KEY_MOVE_WINDOW_TO_PREVIOUS_SCREEN: Tuple[int, int] = (Xlib.XK.XK_Page_Up, KEY_MODMASK | Xlib.X.ShiftMask)
-KEY_MOVE_WINDOW_TO_NEXT_SCREEN: Tuple[int, int] = (Xlib.XK.XK_Page_Down, KEY_MODMASK | Xlib.X.ShiftMask)
+KEY_MOVE_WINDOW_TO_PREVIOUS_SCREEN: Tuple[int, int] = (Xlib.XK.XK_Page_Down, KEY_MODMASK | Xlib.X.ShiftMask)
+KEY_MOVE_WINDOW_TO_NEXT_SCREEN: Tuple[int, int] = (Xlib.XK.XK_Page_Up, KEY_MODMASK | Xlib.X.ShiftMask)
 
 INT16_MAX: int = (1 << 15) - 1
 TASK_WINDOW_MOVE_MARKER = "TASK_WINDOW_MOVE_MARKER"
